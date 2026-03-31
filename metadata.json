@@ -1,0 +1,5 @@
+{
+  "name": "CSV Duplicate Resolver",
+  "description": "Upload a CSV, group by a unique identifier, and let Gemini 3 Flash resolve conflicting rows into a single Golden Record.",
+  "requestFramePermissions": []
+}
