@@ -6,30 +6,81 @@
 import React, { useState, useEffect, useRef } from 'react';
 import Papa from 'papaparse';
 import { CsvRow, ConflictCase, ProcessedResult } from './types';
-import { mergeCsvRowsWithFlash } from './services/geminiService';
 import { LogTerminal } from './components/LogTerminal';
-import { Zap, Play, Upload, Database, Layers, FileJson, Terminal, ArrowRight, CheckCircle2, AlertCircle, Save } from 'lucide-react';
+import { Zap, Play, Upload, Database, Layers, FileJson, Terminal, ArrowRight, CheckCircle2, AlertCircle, Save, Settings, SlidersHorizontal, Download, BookOpen } from 'lucide-react';
 import * as fuzzball from 'fuzzball';
 import { clsx, type ClassValue } from "clsx"
 import { twMerge } from "tailwind-merge"
+import { EntityConfigTab } from './components/EntityConfigTab';
+import { GoldenConfigTab } from './components/GoldenConfigTab';
+import { GuidelineTab } from './components/GuidelineTab';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+import { exampleCsvData } from './exampleData';
+
+const normalizePhone = (phone: string) => {
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return phone;
+};
+
+const normalizeRow = (row: CsvRow): CsvRow => {
+  return {
+    ...row,
+    first_name: row.first_name?.trim(),
+    last_name: row.last_name?.trim(),
+    email: row.email?.trim().toLowerCase(),
+    phone: normalizePhone(row.phone || ''),
+    state: row.state?.trim().toUpperCase(),
+  };
+};
+
+const applySurvivorship = (rows: CsvRow[], cols: string[]) => {
+  const draft: Record<string, string> = {};
+  cols.forEach(col => {
+    const values = rows.map(r => String(r[col] || '').trim()).filter(v => v && v.toLowerCase() !== 'null' && v.toLowerCase() !== 'n/a');
+    if (values.length === 0) {
+      draft[col] = '';
+      return;
+    }
+    
+    if (col === 'address') {
+      draft[col] = values.reduce((a, b) => a.length > b.length ? a : b);
+    } else if (col === 'email') {
+      draft[col] = values.reduce((a, b) => a.length > b.length ? a : b);
+    } else if (col === 'phone') {
+      draft[col] = values.reduce((a, b) => a.replace(/\D/g, '').length > b.replace(/\D/g, '').length ? a : b);
+    } else {
+      draft[col] = values.reduce((a, b) => a.length > b.length ? a : b);
+    }
+  });
+  return draft;
+};
+
 const App: React.FC = () => {
+  const [activeTab, setActiveTab] = useState<'resolution' | 'config' | 'golden_config' | 'guideline'>('resolution');
   const [csvData, setCsvData] = useState<CsvRow[]>([]);
   const [columns, setColumns] = useState<string[]>([]);
   const [groupingColumn, setGroupingColumn] = useState<string>('customer_id');
   
+  const [dataSourceName, setDataSourceName] = useState<string>('System A');
+  const [dataSources, setDataSources] = useState<{id: string, name: string, columns: string[]}[]>([]);
+  const [goldenRecords, setGoldenRecords] = useState<Record<string, string>[]>([]);
+
   const [queue, setQueue] = useState<ConflictCase[]>([]);
   const [resolutionHistory, setResolutionHistory] = useState<ProcessedResult[]>([]);
-  const [isProcessing, setIsProcessing] = useState(false);
   
   const [processedCount, setProcessedCount] = useState(0);
   const [avgLatency, setAvgLatency] = useState(0);
 
   const [showFinalModal, setShowFinalModal] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [fuzzyThreshold, setFuzzyThreshold] = useState(60);
+  const [processingProgress, setProcessingProgress] = useState<number | null>(null);
   const [finalRecord, setFinalRecord] = useState<Record<string, string> | null>(null);
   const [finalizingResultId, setFinalizingResultId] = useState<string | null>(null);
   const [selectedConflictId, setSelectedConflictId] = useState<string | null>(null);
@@ -61,35 +112,27 @@ const App: React.FC = () => {
     }
   }, [resolutionHistory]);
 
-  const recalculateConflicts = (data: CsvRow[], groupCol: string) => {
-    const conflicts = findDuplicates(data, groupCol);
+  const recalculateConflicts = async (data: CsvRow[], groupCol: string) => {
+    const conflicts = await findDuplicates(data, groupCol, fuzzyThreshold);
     setQueue(conflicts);
     
+    const displayColumns = ['customer_id', 'first_name', 'last_name', 'email', 'phone', 'address', 'city', 'state', 'zip', 'date_of_birth', 'job_title'];
+
     const initialHistory: ProcessedResult[] = conflicts.map(c => {
-        const draftRecord: Record<string, string> = {};
+        const draftRecord = applySurvivorship(c.rows, displayColumns);
         const fieldConflicts: Record<string, boolean> = {};
-        const displayColumns = ['customer_id', 'first_name', 'last_name', 'email', 'phone', 'address', 'city', 'state', 'zip', 'date_of_birth', 'job_title'];
 
         displayColumns.forEach(col => {
-            const values = c.rows.map(r => String(r[col] || '').trim()).filter(v => v !== '' && v !== 'NULL' && v !== 'None' && v !== 'null' && v !== 'n/a' && v !== 'NA');
+            const values = c.rows.map(r => String(r[col] || '').trim()).filter(v => v !== '' && v.toLowerCase() !== 'null' && v.toLowerCase() !== 'n/a');
             const uniqueValues = Array.from(new Set(values));
-
-            if (uniqueValues.length === 1) {
-                draftRecord[col] = uniqueValues[0];
-                fieldConflicts[col] = false;
-            } else if (uniqueValues.length > 1) {
-                fieldConflicts[col] = true;
-            } else {
-                draftRecord[col] = '';
-                fieldConflicts[col] = false;
-            }
+            fieldConflicts[col] = uniqueValues.length > 1;
         });
 
         return {
             id: c.id,
             input: c,
-            output: null,
-            logs: ["Waiting for resolution..."],
+            output: draftRecord,
+            logs: ["System applied Survivorship Rules (Longest string, E.164 phone, etc.)"],
             durationMs: 0,
             status: 'pending',
             draftRecord,
@@ -103,15 +146,16 @@ const App: React.FC = () => {
     setSelectedConflictId(initialHistory.length > 0 ? initialHistory[0].id : null);
   };
 
-  const processCsvData = (data: CsvRow[], cols: string[]) => {
-    setCsvData(data);
+  const processCsvData = async (data: CsvRow[], cols: string[]) => {
+    const normalizedData = data.map(normalizeRow);
+    setCsvData(normalizedData);
     
     const possibleCols = ['customer_id', 'id', 'email', 'phone', 'name'];
     const detectedCol = cols.find(c => possibleCols.includes(c.toLowerCase()));
     const initialGroupCol = detectedCol || (cols.length > 0 ? cols[0] : 'customer_id');
     setGroupingColumn(initialGroupCol);
 
-    recalculateConflicts(data, initialGroupCol);
+    await recalculateConflicts(normalizedData, initialGroupCol);
   };
 
   const handleGroupingColumnChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -132,6 +176,12 @@ const App: React.FC = () => {
         const cols = results.meta.fields || [];
         setColumns(cols);
         
+        setDataSources(prev => {
+          const existing = prev.find(s => s.name === dataSourceName);
+          if (existing) return prev.map(s => s.name === dataSourceName ? { ...s, columns: cols } : s);
+          return [...prev, { id: `src_${Date.now()}`, name: dataSourceName, columns: cols }];
+        });
+
         const rows: CsvRow[] = data.map((row, idx) => ({
           _id: `row-${idx}`,
           ...row
@@ -143,20 +193,21 @@ const App: React.FC = () => {
 
   const loadExampleData = async () => {
     try {
-      const response = await fetch('/customer_master_data_practice.csv');
-      if (!response.ok) {
-        throw new Error('Failed to load example data');
-      }
-      const csvText = await response.text();
-      
-      Papa.parse(csvText, {
+      Papa.parse(exampleCsvData, {
         header: true,
         skipEmptyLines: true,
         complete: (results) => {
           const data = results.data as any[];
           const cols = results.meta.fields || [];
           setColumns(cols);
+          setDataSourceName('Example Data');
           
+          setDataSources(prev => {
+            const existing = prev.find(s => s.name === 'Example Data');
+            if (existing) return prev.map(s => s.name === 'Example Data' ? { ...s, columns: cols } : s);
+            return [...prev, { id: `src_example`, name: 'Example Data', columns: cols }];
+          });
+
           const rows: CsvRow[] = data.map((row, idx) => ({
             _id: `row-${idx}`,
             ...row
@@ -170,7 +221,7 @@ const App: React.FC = () => {
     }
   };
 
-  const findDuplicates = (data: CsvRow[], groupColumn: string) => {
+  const findDuplicates = async (data: CsvRow[], groupColumn: string, threshold: number) => {
     const conflicts: ConflictCase[] = [];
     let conflictIdCounter = 0;
 
@@ -228,10 +279,10 @@ const App: React.FC = () => {
             const isZipMatch = zipA && zipB && zipA === zipB;
             const isEmailMatch = emailA && emailB && emailA === emailB;
 
-            // If email matches exactly, we can be more lenient on the name (e.g., Bob vs Robert)
-            const isStrongEmailMatch = isEmailMatch && nameRatio > 60;
-            // If only zip matches, we need a stronger name match
-            const isStrongZipMatch = isZipMatch && nameRatio > 85;
+            // If email matches exactly, we can be more lenient on the name
+            const isStrongEmailMatch = isEmailMatch && nameRatio >= threshold;
+            // If only zip matches, we need a stronger name match (e.g., threshold + 20)
+            const isStrongZipMatch = isZipMatch && nameRatio >= Math.min(100, threshold + 20);
 
             if (isStrongEmailMatch || isStrongZipMatch) {
                 currentGroup.push(rowB);
@@ -241,6 +292,11 @@ const App: React.FC = () => {
 
         if (currentGroup.length > 1) {
             fuzzyGroups.push(currentGroup);
+        }
+
+        if (i % 10 === 0) {
+            setProcessingProgress(Math.round((i / remainingRows.length) * 100));
+            await new Promise(resolve => setTimeout(resolve, 0));
         }
     }
 
@@ -253,60 +309,8 @@ const App: React.FC = () => {
         });
     });
 
+    setProcessingProgress(null);
     return conflicts;
-  };
-
-  const resolveWithGemini = async (item: ConflictCase) => {
-    setResolutionHistory(prev => prev.map(r => {
-      if (r.id === item.id) {
-        return { ...r, status: 'processing', logs: ["Analyzing conflicting rows..."] };
-      }
-      return r;
-    }));
-
-    const start = performance.now();
-    const result = await mergeCsvRowsWithFlash(item.rows);
-    const duration = performance.now() - start;
-
-    setResolutionHistory(prev => prev.map(r => {
-      if (r.id === item.id) {
-        return {
-          ...r,
-          output: result.json,
-          draftRecord: result.json || r.draftRecord,
-          logs: result.logs,
-          durationMs: duration,
-          status: 'completed'
-        };
-      }
-      return r;
-    }));
-
-    setProcessedCount(prev => {
-      const newCount = prev + 1;
-      setAvgLatency(prevAvg => (prevAvg * prev + duration) / newCount);
-      return newCount;
-    });
-  };
-
-  const resolveAllWithGemini = async () => {
-    const pendingItems = resolutionHistory.filter(r => r.status === 'pending').map(r => r.input);
-    if (isProcessing || pendingItems.length === 0) return;
-    setIsProcessing(true);
-
-    let currentIdx = 0;
-
-    const processNext = async () => {
-      if (currentIdx >= pendingItems.length) {
-        setIsProcessing(false);
-        return;
-      }
-      await resolveWithGemini(pendingItems[currentIdx]);
-      currentIdx++;
-      setTimeout(processNext, 500);
-    };
-
-    processNext();
   };
 
   const handleFieldSelect = (resultId: string, field: string, value: string) => {
@@ -349,6 +353,9 @@ const App: React.FC = () => {
               return newData;
           });
 
+          // Add to golden records
+          setGoldenRecords(prev => [...prev, finalRecord]);
+
           // Mark as resolved in history
           setResolutionHistory(prev => {
               const newHistory = prev.map(r => {
@@ -376,96 +383,177 @@ const App: React.FC = () => {
       setFinalizingResultId(null);
   };
 
+  const exportGoldenRecords = () => {
+    if (goldenRecords.length === 0) return;
+    const csv = Papa.unparse(goldenRecords);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'golden_records.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const latestResult = resolutionHistory.length > 0 ? resolutionHistory[resolutionHistory.length - 1] : null;
 
   const displayColumns = ['customer_id', 'first_name', 'last_name', 'email', 'phone', 'address', 'city', 'state', 'zip', 'date_of_birth', 'job_title'];
 
   return (
-    <div className="min-h-screen bg-[#121212] text-[#E3E3E3] p-6 font-sans">
+    <div className="min-h-screen bg-slate-50 text-slate-900 p-6 font-sans">
       
-      <header className="max-w-[1600px] mx-auto mb-8 flex flex-col md:flex-row justify-between items-center pb-6 border-b border-[#444746]">
+      <header className="max-w-[1600px] mx-auto mb-6 flex flex-col md:flex-row justify-between items-center pb-6 border-b border-slate-200">
         <div className="flex items-center gap-4">
-          <div className="bg-[#1E1E1E] p-3 rounded-2xl shadow-lg border border-[#444746]">
-            <Layers className="text-[#8AB4F8]" size={28} />
+          <div className="bg-white p-3 rounded-2xl shadow-lg border border-slate-200">
+            <Layers className="text-blue-600" size={28} />
           </div>
           <div>
-            <h1 className="text-2xl md:text-3xl font-normal text-[#E3E3E3] tracking-tight">
+            <h1 className="text-2xl md:text-3xl font-normal text-slate-900 tracking-tight">
               Golden Record Mastering
             </h1>
-            <p className="text-[#C4C7C5] text-sm mt-1 max-w-3xl">
+            <p className="text-slate-500 text-sm mt-1 max-w-3xl">
               Upload a CSV, identify duplicates via exact and fuzzy matching, and interactively build a Golden Record.
             </p>
           </div>
         </div>
         
         <div className="flex gap-4 mt-6 md:mt-0 items-center">
-          {columns.length > 0 && (
-            <div className="flex items-center gap-2 px-4 py-2 rounded-full border border-[#444746] bg-[#1E1E1E]">
-              <label className="text-xs text-[#C4C7C5] font-medium uppercase tracking-wider">Primary Key:</label>
+          <div className="flex items-center gap-2 px-4 py-2 rounded-full border border-slate-200 bg-white">
+            <label className="text-xs text-slate-500 font-medium uppercase tracking-wider">Source Tag:</label>
+            <input 
+              type="text" 
+              value={dataSourceName} 
+              onChange={(e) => setDataSourceName(e.target.value)}
+              className="bg-transparent text-slate-900 text-sm focus:outline-none w-24"
+              placeholder="e.g. CRM"
+            />
+          </div>
+          {columns.length > 0 && activeTab === 'resolution' && (
+            <div className="flex items-center gap-2 px-4 py-2 rounded-full border border-slate-200 bg-white">
+              <label className="text-xs text-slate-500 font-medium uppercase tracking-wider">Primary Key:</label>
               <select 
                 value={groupingColumn} 
                 onChange={handleGroupingColumnChange}
-                className="bg-transparent text-[#E3E3E3] text-sm focus:outline-none cursor-pointer"
+                className="bg-transparent text-slate-900 text-sm focus:outline-none cursor-pointer"
               >
                 {columns.map(col => (
-                  <option key={col} value={col} className="bg-[#1E1E1E]">{col}</option>
+                  <option key={col} value={col} className="bg-white">{col}</option>
                 ))}
               </select>
             </div>
           )}
           <button 
             onClick={loadExampleData}
-            className="flex items-center gap-2 px-6 py-3 rounded-full border border-[#8AB4F8] text-[#8AB4F8] hover:bg-[#8AB4F8]/10 transition-colors text-sm font-medium tracking-wide uppercase cursor-pointer"
+            className="flex items-center gap-2 px-6 py-3 rounded-full border border-blue-600 text-blue-600 hover:bg-blue-50 transition-colors text-sm font-medium tracking-wide uppercase cursor-pointer"
           >
             Load Example Data
           </button>
           
-          <label className="flex items-center gap-2 px-6 py-3 rounded-full border border-[#8AB4F8] text-[#8AB4F8] hover:bg-[#8AB4F8]/10 transition-colors text-sm font-medium tracking-wide uppercase cursor-pointer">
+          <label className="flex items-center gap-2 px-6 py-3 rounded-full border border-blue-600 text-blue-600 hover:bg-blue-50 transition-colors text-sm font-medium tracking-wide uppercase cursor-pointer">
             <Upload size={18} />
             Upload CSV
             <input type="file" accept=".csv" className="hidden" onChange={handleFileUpload} />
           </label>
+
+          <button 
+            onClick={exportGoldenRecords}
+            disabled={goldenRecords.length === 0}
+            className="flex items-center gap-2 px-6 py-3 rounded-full border border-green-600 text-green-600 hover:bg-green-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm font-medium tracking-wide uppercase cursor-pointer"
+          >
+            <Download size={18} />
+            Export ({goldenRecords.length})
+          </button>
         </div>
       </header>
 
-      <main className="max-w-[1600px] mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        
-        <section className="lg:col-span-3 flex flex-col gap-6 lg:sticky lg:top-6 lg:h-[calc(100vh-3rem)]">
-           <div className="flex flex-col gap-4 flex-1 min-h-0">
-               <div className="flex justify-between items-center px-2">
-                    <h2 className="text-lg font-medium text-[#E3E3E3] flex items-center gap-2">
-                        <Database size={18} className="text-[#C4C7C5]"/> 
-                        Conflict Clusters
-                    </h2>
-                    <span className="bg-[#1E1E1E] border border-[#444746] text-[#E3E3E3] text-xs font-bold px-3 py-1 rounded-full">{resolutionHistory.length}</span>
-               </div>
-               
-               <div className="bg-[#1E1E1E] rounded-[24px] p-2 flex-1 shadow-sm border border-[#444746] overflow-hidden flex flex-col min-h-[200px]">
-                 <div className="flex-1 overflow-y-auto space-y-2 p-2 custom-scrollbar">
-                   {resolutionHistory.length === 0 && (
-                     <div className="flex flex-col items-center justify-center h-full text-[#757775]">
-                        <Database size={32} className="opacity-20 mb-3" />
-                        <span className="italic text-sm">No conflicts found</span>
-                     </div>
-                   )}
-                   {resolutionHistory.map((item) => (
-                     <div 
-                        key={item.id} 
-                        onClick={() => setSelectedConflictId(item.id)}
-                        className={cn("p-4 rounded-xl border transition-all group relative overflow-hidden cursor-pointer",
-                          selectedConflictId === item.id ? "bg-[#2B2B2B] border-[#8AB4F8]" : "bg-[#1E1E1E] border-transparent hover:border-[#8AB4F8]/30"
-                        )}
-                     >
-                       <div className="flex justify-between items-center mb-2">
-                         <span className="text-[#8AB4F8] text-[10px] font-mono tracking-wider truncate mr-2">{item.input.groupKey}</span>
-                         <span className="text-[#757775] text-[10px] shrink-0">{item.input.rows.length} rows</span>
+      <div className="max-w-[1600px] mx-auto mb-6 flex gap-2 border-b border-slate-200 overflow-x-auto">
+        <button
+          onClick={() => setActiveTab('resolution')}
+          className={cn(
+            "px-6 py-3 text-sm font-medium transition-colors border-b-2 flex items-center gap-2 whitespace-nowrap",
+            activeTab === 'resolution' ? "border-blue-600 text-blue-600" : "border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300"
+          )}
+        >
+          <Database size={16} />
+          Data Resolution
+        </button>
+        <button
+          onClick={() => setActiveTab('config')}
+          className={cn(
+            "px-6 py-3 text-sm font-medium transition-colors border-b-2 flex items-center gap-2 whitespace-nowrap",
+            activeTab === 'config' ? "border-blue-600 text-blue-600" : "border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300"
+          )}
+        >
+          <SlidersHorizontal size={16} />
+          Entity Configuration
+        </button>
+        <button
+          onClick={() => setActiveTab('golden_config')}
+          className={cn(
+            "px-6 py-3 text-sm font-medium transition-colors border-b-2 flex items-center gap-2 whitespace-nowrap",
+            activeTab === 'golden_config' ? "border-blue-600 text-blue-600" : "border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300"
+          )}
+        >
+          <Database size={16} />
+          Golden Configuration
+        </button>
+        <button
+          onClick={() => setActiveTab('guideline')}
+          className={cn(
+            "px-6 py-3 text-sm font-medium transition-colors border-b-2 flex items-center gap-2 whitespace-nowrap",
+            activeTab === 'guideline' ? "border-blue-600 text-blue-600" : "border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300"
+          )}
+        >
+          <BookOpen size={16} />
+          Guideline & Behind the Scenes
+        </button>
+      </div>
+
+      <main className="max-w-[1600px] mx-auto">
+        {activeTab === 'resolution' ? (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+            <section className="lg:col-span-3 flex flex-col gap-6 lg:sticky lg:top-6 lg:h-[calc(100vh-14rem)]">
+              <div className="flex flex-col gap-4 flex-1 min-h-0">
+                  <div className="flex justify-between items-center px-2">
+                      <h2 className="text-lg font-medium text-slate-900 flex items-center gap-2">
+                          <Database size={18} className="text-slate-500"/> 
+                          Conflict Clusters
+                      </h2>
+                      {processingProgress !== null ? (
+                          <span className="text-blue-600 text-xs font-bold px-3 py-1 rounded-full bg-blue-50 border border-blue-200">
+                              Processing {processingProgress}%
+                          </span>
+                      ) : (
+                          <span className="bg-white border border-slate-200 text-slate-900 text-xs font-bold px-3 py-1 rounded-full">{resolutionHistory.length}</span>
+                      )}
+                  </div>
+                  
+                  <div className="bg-white rounded-[24px] p-2 flex-1 shadow-sm border border-slate-200 overflow-hidden flex flex-col min-h-[200px]">
+                    <div className="flex-1 overflow-y-auto space-y-2 p-2 custom-scrollbar">
+                      {resolutionHistory.length === 0 && (
+                        <div className="flex flex-col items-center justify-center h-full text-slate-400">
+                          <Database size={32} className="opacity-20 mb-3" />
+                          <span className="italic text-sm">No conflicts found</span>
+                        </div>
+                      )}
+                      {resolutionHistory.map((item) => (
+                        <div 
+                          key={item.id} 
+                          onClick={() => setSelectedConflictId(item.id)}
+                          className={cn("p-4 rounded-xl border transition-all group relative overflow-hidden cursor-pointer",
+                            selectedConflictId === item.id ? "bg-slate-100 border-blue-600" : "bg-white border-transparent hover:border-blue-300"
+                          )}
+                        >
+                          <div className="flex justify-between items-center mb-2">
+                            <span className="text-blue-600 text-[10px] font-mono tracking-wider truncate mr-2">{item.input.groupKey}</span>
+                            <span className="text-slate-400 text-[10px] shrink-0">{item.input.rows.length} rows</span>
                        </div>
                        <div className="mt-2 flex justify-between items-center">
                          <span className={cn("text-[10px] px-2 py-0.5 rounded uppercase font-bold tracking-wider",
-                           item.status === 'resolved' ? 'bg-[#1b5e20] text-[#a8dab5]' :
-                           item.status === 'completed' ? 'bg-[#004A77] text-[#78D9EC]' :
-                           item.status === 'processing' ? 'bg-[#004A77] text-[#78D9EC] animate-pulse' :
-                           'bg-[#444746] text-[#C4C7C5]'
+                           item.status === 'resolved' ? 'bg-green-100 text-green-700' :
+                           item.status === 'completed' ? 'bg-blue-100 text-blue-700' :
+                           item.status === 'processing' ? 'bg-blue-100 text-blue-700 animate-pulse' :
+                           'bg-slate-200 text-slate-500'
                          )}>
                            {item.status}
                          </span>
@@ -477,10 +565,10 @@ const App: React.FC = () => {
            </div>
 
            <div className="h-[300px] shrink-0 flex flex-col gap-2">
-               <h2 className="text-sm font-medium text-[#C4C7C5] px-2 flex items-center gap-2">
+               <h2 className="text-sm font-medium text-slate-500 px-2 flex items-center gap-2">
                   <Terminal size={14}/> Live Output Log
                </h2>
-               <div className="flex-1 bg-[#1E1E1E] rounded-2xl border border-[#444746] overflow-hidden shadow-lg">
+               <div className="flex-1 bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-lg">
                   <LogTerminal 
                     logs={latestResult ? latestResult.logs : []} 
                     type="flash" 
@@ -490,47 +578,33 @@ const App: React.FC = () => {
         </section>
 
         <section className="lg:col-span-9 flex flex-col gap-6">
-          <div className="bg-[#121212] rounded-[32px] border border-[#444746] p-1 shadow-2xl relative flex flex-col min-h-[800px]">
-             <div className="absolute inset-0 opacity-10 pointer-events-none" 
-                  style={{ backgroundImage: 'radial-gradient(#444746 1px, transparent 1px)', backgroundSize: '24px 24px' }}>
+          <div className="bg-white rounded-[32px] border border-slate-200 p-1 shadow-lg relative flex flex-col min-h-[calc(100vh-10rem)]">
+             <div className="absolute inset-0 opacity-5 pointer-events-none" 
+                  style={{ backgroundImage: 'radial-gradient(#94a3b8 1px, transparent 1px)', backgroundSize: '24px 24px' }}>
              </div>
 
-             <div className="sticky top-0 z-30 p-6 flex justify-between items-center bg-[#1E1E1E]/90 backdrop-blur-md rounded-t-[28px] border-b border-[#444746]">
+             <div className="sticky top-0 z-30 p-6 flex justify-between items-center bg-white/90 backdrop-blur-md rounded-t-[28px] border-b border-slate-200">
                 <div className="flex items-center gap-3">
-                   <div className="w-10 h-10 rounded-full bg-[#004A77] flex items-center justify-center">
-                      <Zap className="fill-[#78D9EC] text-[#78D9EC]" size={20} />
+                   <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center">
+                      <Zap className="fill-blue-600 text-blue-600" size={20} />
                    </div>
                    <div>
-                       <h2 className="text-lg font-medium text-[#E3E3E3]">Data Steward Workspace</h2>
-                       <p className="text-xs text-[#C4C7C5]">Interactively resolve conflicts to build a Golden Record.</p>
+                       <h2 className="text-lg font-medium text-slate-900">Data Steward Workspace</h2>
+                       <p className="text-xs text-slate-500">Interactively resolve conflicts to build a Golden Record.</p>
                    </div>
                 </div>
-                {resolutionHistory.filter(r => r.status === 'pending').length > 0 && (
-                    <button 
-                        onClick={resolveAllWithGemini}
-                        disabled={isProcessing}
-                        className={cn("flex items-center gap-2 px-4 py-2 rounded-full text-xs font-bold uppercase tracking-wider transition-colors",
-                            isProcessing 
-                                ? "bg-[#1E1E1E] text-[#757775] cursor-not-allowed border border-[#444746]"
-                                : "bg-[#004A77] hover:bg-[#8AB4F8] hover:text-[#001D35] text-[#D3E3FD]"
-                        )}
-                    >
-                        <Zap size={14} />
-                        {isProcessing ? 'Processing...' : 'Resolve All with AI'}
-                    </button>
-                )}
              </div>
 
              <div className="relative z-10 p-6 pb-20">
-                {resolutionHistory.filter(r => r.status !== 'resolved').length === 0 ? (
-                    <div className="flex flex-col items-center justify-center min-h-[600px] opacity-30">
-                        <Layers size={80} className="mb-4 text-[#8AB4F8]" />
-                        <p className="text-xl">System Idle</p>
-                        <p className="text-sm mt-2">Load example data or upload a CSV to begin mastering.</p>
+                {resolutionHistory.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center min-h-[600px] opacity-50">
+                        <Layers size={80} className="mb-4 text-blue-400" />
+                        <p className="text-xl text-slate-600">System Idle</p>
+                        <p className="text-sm mt-2 text-slate-500">Load example data or upload a CSV to begin mastering.</p>
                     </div>
                 ) : (
                     <div className="space-y-16">
-                        {resolutionHistory.filter(r => r.id === selectedConflictId && r.status !== 'resolved').map((result) => {
+                        {resolutionHistory.filter(r => r.id === selectedConflictId).map((result) => {
                           const isReadyToFinalize = displayColumns.every(col => result.draftRecord && result.draftRecord[col] !== undefined);
 
                           return (
@@ -539,36 +613,22 @@ const App: React.FC = () => {
                                 className="transition-all duration-700 ease-in-out opacity-100 scale-100"
                             >
                                 <div className="mb-4 flex items-center justify-between">
-                                    <h3 className="text-xl font-semibold text-[#8AB4F8]">{result.input.groupKey}</h3>
-                                    {result.status === 'pending' && (
-                                        <button 
-                                            onClick={() => resolveWithGemini(result.input)}
-                                            disabled={isProcessing}
-                                            className={cn("flex items-center gap-2 px-4 py-2 rounded-full transition-colors text-xs font-bold uppercase tracking-wider",
-                                                isProcessing 
-                                                    ? "bg-[#1E1E1E] text-[#757775] cursor-not-allowed border border-[#444746]"
-                                                    : "bg-[#004A77] hover:bg-[#8AB4F8] hover:text-[#001D35] text-[#D3E3FD]"
-                                            )}
-                                        >
-                                            <Zap size={14} />
-                                            Resolve with AI
-                                        </button>
-                                    )}
-                                    {result.status === 'processing' && (
-                                        <span className="flex items-center gap-2 text-[#78D9EC] text-xs font-bold uppercase tracking-wider animate-pulse">
-                                            <Zap size={14} />
-                                            AI is Thinking...
+                                    <h3 className="text-xl font-semibold text-blue-600">{result.input.groupKey}</h3>
+                                    {result.status === 'resolved' && (
+                                        <span className="flex items-center gap-2 text-green-600 text-xs font-bold uppercase tracking-wider">
+                                            <CheckCircle2 size={14} />
+                                            Resolved
                                         </span>
                                     )}
                                 </div>
 
-                                <div className="overflow-x-auto bg-[#1E1E1E] rounded-2xl border border-[#444746] shadow-lg">
+                                <div className="overflow-x-auto bg-slate-50 rounded-2xl border border-slate-200 shadow-sm">
                                     <table className="w-full text-sm text-left">
-                                        <thead className="text-xs text-[#C4C7C5] uppercase bg-[#2B2B2B] border-b border-[#444746]">
+                                        <thead className="text-xs text-slate-500 uppercase bg-slate-100 border-b border-slate-200">
                                             <tr>
                                                 <th className="px-4 py-3 font-medium">Field</th>
                                                 {result.input.rows.map((_, i) => (
-                                                    <th key={i} className="px-4 py-3 font-medium border-l border-[#444746]">Record {i + 1}</th>
+                                                    <th key={i} className="px-4 py-3 font-medium border-l border-slate-200">Record {i + 1}</th>
                                                 ))}
                                             </tr>
                                         </thead>
@@ -576,10 +636,10 @@ const App: React.FC = () => {
                                             {displayColumns.map((col) => {
                                                 const hasConflict = result.conflicts?.[col];
                                                 return (
-                                                    <tr key={col} className="border-b border-[#444746]/50 hover:bg-[#2B2B2B]/50 transition-colors">
-                                                        <td className="px-4 py-3 font-medium text-[#E3E3E3] flex items-center gap-2">
+                                                    <tr key={col} className="border-b border-slate-100 hover:bg-slate-100/50 transition-colors">
+                                                        <td className="px-4 py-3 font-medium text-slate-700 flex items-center gap-2">
                                                             {col}
-                                                            {hasConflict && <AlertCircle size={14} className="text-yellow-500" />}
+                                                            {hasConflict && <AlertCircle size={14} className="text-amber-500" />}
                                                         </td>
                                                         {result.input.rows.map((row, i) => {
                                                             const val = String(row[col] || '').trim();
@@ -587,7 +647,7 @@ const App: React.FC = () => {
                                                             const isNullLike = val === '' || val === 'NULL' || val === 'None' || val === 'null' || val === 'n/a' || val === 'NA';
 
                                                             return (
-                                                                <td key={i} className={cn("px-4 py-3 border-l border-[#444746]", hasConflict ? "bg-yellow-500/10" : "")}>
+                                                                <td key={i} className={cn("px-4 py-3 border-l border-slate-200", hasConflict ? "bg-amber-50" : "")}>
                                                                     {!isNullLike ? (
                                                                         <label className="flex items-center gap-2 cursor-pointer group">
                                                                             <input 
@@ -595,14 +655,14 @@ const App: React.FC = () => {
                                                                                 name={`${result.id}-${col}`}
                                                                                 checked={isSelected}
                                                                                 onChange={() => handleFieldSelect(result.id, col, val)}
-                                                                                className="w-4 h-4 text-[#8AB4F8] bg-[#121212] border-[#444746] focus:ring-[#8AB4F8] focus:ring-2"
+                                                                                className="w-4 h-4 text-blue-600 bg-white border-slate-300 focus:ring-blue-500 focus:ring-2"
                                                                             />
-                                                                            <span className={cn("break-all", isSelected ? "text-[#8AB4F8] font-medium" : "text-[#C4C7C5] group-hover:text-[#E3E3E3]")}>
+                                                                            <span className={cn("break-all", isSelected ? "text-blue-700 font-medium" : "text-slate-600 group-hover:text-slate-900")}>
                                                                                 {val}
                                                                             </span>
                                                                         </label>
                                                                     ) : (
-                                                                        <span className="text-[#757775] italic text-xs">Empty</span>
+                                                                        <span className="text-slate-400 italic text-xs">Empty</span>
                                                                     )}
                                                                 </td>
                                                             );
@@ -614,19 +674,19 @@ const App: React.FC = () => {
                                     </table>
                                 </div>
 
-                                <div className="mt-8 bg-[#004A77]/20 border border-[#004A77] rounded-2xl p-6">
+                                <div className="mt-8 bg-blue-50 border border-blue-100 rounded-2xl p-6">
                                     <div className="flex items-center justify-between mb-4">
-                                        <h4 className="text-lg font-medium text-[#78D9EC] flex items-center gap-2">
+                                        <h4 className="text-lg font-medium text-blue-800 flex items-center gap-2">
                                             <CheckCircle2 size={20} />
                                             Draft Golden Record
                                         </h4>
                                         <button
                                             onClick={() => handleFinalize(result)}
                                             disabled={!isReadyToFinalize}
-                                            className={cn("flex items-center gap-2 px-6 py-2 rounded-full text-sm font-medium tracking-wide uppercase transition-all shadow-md",
+                                            className={cn("flex items-center gap-2 px-6 py-2 rounded-full text-sm font-medium tracking-wide uppercase transition-all shadow-sm",
                                                 isReadyToFinalize 
-                                                    ? "bg-[#8AB4F8] text-[#001D35] hover:bg-[#A8C7FA] shadow-lg shadow-[#8AB4F8]/20" 
-                                                    : "bg-[#1E1E1E] text-[#757775] cursor-not-allowed border border-[#444746]"
+                                                    ? "bg-blue-600 text-white hover:bg-blue-700 shadow-blue-600/20" 
+                                                    : "bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200"
                                             )}
                                         >
                                             <Save size={16} />
@@ -635,9 +695,9 @@ const App: React.FC = () => {
                                     </div>
                                     <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                                         {displayColumns.map(col => (
-                                            <div key={col} className="bg-[#121212] p-3 rounded-xl border border-[#444746]">
-                                                <div className="text-[10px] uppercase tracking-wider text-[#C4C7C5] mb-1">{col}</div>
-                                                <div className={cn("text-sm font-mono break-all", result.draftRecord?.[col] ? "text-[#E3E3E3]" : "text-[#757775] italic")}>
+                                            <div key={col} className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+                                                <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">{col}</div>
+                                                <div className={cn("text-sm font-mono break-all", result.draftRecord?.[col] ? "text-slate-800" : "text-slate-400 italic")}>
                                                     {result.draftRecord?.[col] || 'Pending selection...'}
                                                 </div>
                                             </div>
@@ -645,7 +705,7 @@ const App: React.FC = () => {
                                     </div>
                                 </div>
 
-                                <div className="mt-12 border-b border-[#444746]/50 w-full"></div>
+                                <div className="mt-12 border-b border-slate-200 w-full"></div>
                             </div>
                           );
                         })}
@@ -655,41 +715,48 @@ const App: React.FC = () => {
 
           </div>
         </section>
-
+        </div>
+        ) : activeTab === 'config' ? (
+          <EntityConfigTab />
+        ) : activeTab === 'golden_config' ? (
+          <GoldenConfigTab dataSources={dataSources} />
+        ) : (
+          <GuidelineTab />
+        )}
       </main>
 
       {/* Finalize Modal */}
       {showFinalModal && finalRecord && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-            <div className="bg-[#1E1E1E] rounded-3xl border border-[#444746] shadow-2xl max-w-2xl w-full overflow-hidden flex flex-col max-h-[90vh]">
-                <div className="bg-[#004A77] px-6 py-4 flex justify-between items-center border-b border-[#00639B]">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+            <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl max-w-2xl w-full overflow-hidden flex flex-col max-h-[90vh]">
+                <div className="bg-blue-50 px-6 py-4 flex justify-between items-center border-b border-blue-100">
                     <div className="flex items-center gap-2">
-                        <CheckCircle2 size={20} className="text-[#78D9EC]" />
-                        <span className="text-[#D3E3FD] font-medium tracking-wide text-lg">Approve Golden Record</span>
+                        <CheckCircle2 size={20} className="text-blue-600" />
+                        <span className="text-blue-900 font-medium tracking-wide text-lg">Approve Golden Record</span>
                     </div>
-                    <button onClick={() => setShowFinalModal(false)} className="text-[#D3E3FD] hover:text-white">✕</button>
+                    <button onClick={() => setShowFinalModal(false)} className="text-slate-400 hover:text-slate-600">✕</button>
                 </div>
                 <div className="p-6 overflow-y-auto custom-scrollbar flex-1">
-                    <p className="text-[#C4C7C5] mb-6">Please review the finalized Golden Record before saving to the master table. The source duplicates will be marked as resolved.</p>
+                    <p className="text-slate-600 mb-6">Please review the finalized Golden Record before saving to the master table. The source duplicates will be marked as resolved.</p>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         {Object.entries(finalRecord).map(([key, value]) => (
-                            <div key={key} className="bg-[#121212] p-3 rounded-xl border border-[#444746]">
-                                <div className="text-[10px] uppercase tracking-wider text-[#C4C7C5] mb-1">{key}</div>
-                                <div className="text-sm font-mono text-[#E3E3E3] break-all">{value}</div>
+                            <div key={key} className="bg-slate-50 p-3 rounded-xl border border-slate-200">
+                                <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">{key}</div>
+                                <div className="text-sm font-mono text-slate-800 break-all">{value}</div>
                             </div>
                         ))}
                     </div>
                 </div>
-                <div className="p-6 border-t border-[#444746] bg-[#2B2B2B] flex justify-end gap-4">
+                <div className="p-6 border-t border-slate-200 bg-slate-50 flex justify-end gap-4">
                     <button 
                         onClick={() => setShowFinalModal(false)}
-                        className="px-6 py-2 rounded-full text-sm font-medium text-[#E3E3E3] hover:bg-[#444746] transition-colors"
+                        className="px-6 py-2 rounded-full text-sm font-medium text-slate-600 hover:bg-slate-200 transition-colors"
                     >
                         Cancel
                     </button>
                     <button 
                         onClick={handleApprove}
-                        className="flex items-center gap-2 px-8 py-2 rounded-full text-sm font-medium bg-[#8AB4F8] text-[#001D35] hover:bg-[#A8C7FA] transition-colors shadow-lg shadow-[#8AB4F8]/20"
+                        className="flex items-center gap-2 px-8 py-2 rounded-full text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors shadow-lg shadow-blue-600/20"
                     >
                         <Save size={16} />
                         Approve & Save
@@ -708,7 +775,7 @@ const App: React.FC = () => {
           background: transparent;
         }
         .custom-scrollbar::-webkit-scrollbar-thumb {
-          background-color: #444746;
+          background-color: #cbd5e1;
           border-radius: 20px;
         }
       `}</style>
